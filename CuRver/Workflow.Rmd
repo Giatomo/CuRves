@@ -1,0 +1,318 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Analyse 96 wells plate
+
+## Import and read data
+
+```{r}
+library(tidyverse)
+
+# Select your excel file
+
+exp_excel_file <- svDialogs::dlg_open(
+  title = "Select your the excel sheet containing your data")$res
+
+# Select excel sheets containing your data
+
+OD_sheet   <- svDialogs::dlg_list(
+  choices = readxl::excel_sheets(exp_excel_file),
+  title = "Select the sheet containg your OD data")$res
+
+fluo_sheet <- svDialogs::dlg_list(
+  choices = readxl::excel_sheets(exp_excel_file),
+  title = "Select the sheet containg your fluo data")$res
+
+data <- list()
+
+# Import your data into R
+
+data$OD <- readxl::read_xlsx(
+  path = exp_excel_file,
+  sheet = OD_sheet,
+  na = "OVRFLW")
+
+  
+data$fluo <- readxl::read_xlsx(
+  path = exp_excel_file,
+  sheet = fluo_sheet,
+  na = "OVRFLW")  |> 
+  mutate(signal = "Fluo")
+
+data <- purrr::map(
+  data,
+  .f = ~. |> 
+    select(-matches(regex("T°"))) |> 
+    clean_time(Time) |> 
+    format_wellplate_long())
+
+```
+
+## Select the portion of data you wish to fit
+
+```{r}
+# TO-DO : ADD OPTION TO HAVE ALL THE SAME CUTOFFS EASILY
+
+cutoff <- purrr::map(
+  data,
+  .f = ~. |> 
+    run_time_cutoff() |> 
+    rrapply::rrapply(how = "melt") |> 
+    pivot_wider(names_from  = L2,
+                values_from = value)|> 
+    rename(well = L1))
+
+data <- purrr::map2(data, cutoff,
+  ~ .x |> full_join(.y)
+)
+
+
+
+```
+
+## Select your different condition and corresponding blanks
+
+```{r}
+conditions <- run_conditions_sorter(wells = unique(data$fluo$well)) |> 
+  rrapply::rrapply(how = "melt") |> 
+  unnest_longer(value) |> 
+  rename(condition =  L1, type = L2, well = value)
+
+
+data <- purrr::map(
+  data,
+  .f = ~. |> 
+    full_join(conditions) |> 
+    group_by(condition, Time) |> 
+    mutate(blank = mean(value[type == "blanks"])) |> 
+    mutate(value = if_else(is.na(value - blank), value, value - blank)) |> 
+    filter(type != "blanks") |> 
+    ungroup())
+
+```
+## Fit the data
+
+```{r}
+
+# Fit parameters for every well
+parameters_fit_by_well <- purrr::map(
+  data, 
+  .f = ~. |> 
+    rowwise() |> 
+    filter(between(Time, min, max)) |> 
+    fit_data(well, value, Time, method = "LAD") |> 
+    select(well, p_max, p_min, r_max, s))
+
+# Fit parameters for every condition using all the data
+parameters_fit_by_condition <- purrr::map(
+  data,
+  .f = ~. |> 
+    rowwise() |> 
+    filter(between(Time, min, max)) |> 
+    fit_data(condition, value, Time, method = "LAD") |> 
+    select(condition, p_max, p_min, r_max, s))
+
+data_well_based <- purrr::map2(
+  data, parameters_fit_by_well,
+  .f = ~.x |> 
+    full_join(.y, by = c("well" = "well")) |> 
+    mutate(fit = richard(Time, p_max, p_min, r_max, s),
+           doubling_time = log(2)/log(1+r_max/p_max)))
+
+
+data_condition_based <- purrr::map2(
+  data, parameters_fit_by_condition,
+  .f = ~.x |> 
+    full_join(.y, by = c("condition" = "condition")) |> 
+    mutate(fit = richard(Time, p_max, p_min, r_max, s),
+           doubling_time = log(2)/log(1+r_max/p_max)))
+
+
+```
+## Save to an Excel file
+
+```{r}
+filepath <- svDialogs::dlg_save(filters = c("Excel files (*.xlsx)", "*.xlsx"))$res
+
+data |> purrr::iwalk(.f = ~.x |> 
+    as.data.frame() |>
+    xlsx::write.xlsx(file = filepath,
+                     sheetName = .y,
+                     append = TRUE,
+                     row.names = FALSE,
+                     col.names = TRUE))
+```
+
+
+# Plotting
+```{r}
+data_full <- data_condition_based$OD |> mutate(units = "OD") |>
+  bind_rows(data_condition_based$fluo |> mutate(units = "Fluo")) |> 
+  extract(well, into = c("row", "col"), regex = "(\\w)(\\d+)", remove = FALSE) |>
+  mutate(col = as.numeric(col)) 
+
+linear <- function(x,a,b){a * x + b}
+
+data_full |>
+  filter(units == "OD") |> 
+  ggplot(aes(x = Time, y = value, color = condition)) +
+  geom_line() +
+  facet_grid(col ~ row) +
+  theme_minimal() -> p_overview_od
+
+data_full |>
+  filter(units == "Fluo") |> 
+  ggplot(aes(x = Time, y = value, color = condition)) +
+  geom_line() +
+  facet_grid(col ~ row) +
+  theme_minimal() -> p_overview_fluo
+
+data_full |>
+  filter(units == "OD") |> 
+  drop_na(condition) |> 
+  mutate(intercept = richard(s, p_max, p_min, r_max, s) - r_max * s) |> 
+  ggplot(aes(x = Time, y = value, group = well)) +
+  geom_point(alpha = .4,  color = '#7570b3') +
+  geom_hline(aes(yintercept = p_max), linetype = "dashed", color = "#1B9E77")+
+  geom_hline(aes(yintercept = p_min), linetype = "dashed", color = "#1B9E77")+
+  geom_segment(aes(x = s, xend = s,
+                   y = p_min, yend = richard(s, p_max, p_min, r_max, s)),
+               linetype = "dashed",
+               color = "#1B9E77") +
+  geom_segment(aes(x = s, xend = max(Time),
+                   y = richard_root(p_max, p_min, r_max, s), yend = richard(s, p_max, p_min, r_max, s)),
+               linetype = "dashed",
+               color = "#1B9E77") +
+  geom_line(aes(y = linear(Time, r_max, intercept)), linetype = "dashed", color = "#1B9E77") +
+    geom_line(aes(y = fit), color = 'black') +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(limits = c(0,1), expand = c(0,0)) +
+  facet_wrap(~condition) +
+  theme_minimal() -> p_param_od
+
+data_full |>
+  filter(units == "Fluo") |> 
+  drop_na(condition) |> 
+  mutate(intercept = richard(s, p_max, p_min, r_max, s) - r_max * s) |> 
+  ggplot(aes(x = Time, y = value, group = well)) +
+  geom_point(alpha = .4,  color = '#7570b3') +
+  geom_hline(aes(yintercept = p_max), linetype = "dashed", color = "#1B9E77")+
+  geom_hline(aes(yintercept = p_min), linetype = "dashed", color = "#1B9E77")+
+  geom_segment(aes(x = s, xend = s,
+                   y = p_min, yend = richard(s, p_max, p_min, r_max, s)),
+               linetype = "dashed",
+               color = "#1B9E77") +
+  geom_segment(aes(x = s, xend = max(Time),
+                   y = richard_root(p_max, p_min, r_max, s), yend = richard(s, p_max, p_min, r_max, s)),
+               linetype = "dashed",
+               color = "#1B9E77") +
+  geom_line(aes(y = linear(Time, r_max, intercept)), linetype = "dashed", color = "#1B9E77") +
+  geom_line(aes(y = fit), color = 'black') +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(limits = c(0,4000), expand = c(0,0)) +
+  facet_wrap(~condition) +
+  theme_minimal() -> p_param_fluo
+
+col <- c("#1B9E77","#d95f02","#7570b3","#e7298a", "#66a61e", "#e6ab02")
+
+data_full |>
+  filter(units == "OD") |>
+  ggplot(aes(x = Time, y = value, group = well, color = condition)) +
+  geom_point(size = .8, alpha = .4) +
+  geom_line(aes(y = fit), size = .7) +
+  scale_color_manual(values = col) +
+  theme_minimal() -> p_cond_od
+
+data_full |>
+  filter(units == "Fluo") |>
+  ggplot(aes(x = Time, y = value, group = well, color = condition)) +
+  geom_point(size = .8, alpha = .4) +
+  geom_line(aes(y = fit), size = .7) +
+  scale_color_manual(values = col) +
+  theme_minimal() -> p_cond_fluo
+
+data_full |> 
+  filter(units == "Fluo") |> 
+  drop_na(r_max) |> 
+  ggplot(aes(x = r_max, y = condition)) +
+    geom_point(color = "#d95f02", size = 4) + 
+    xlim(c(0, NA)) +
+    theme_minimal() -> p_rmax_fluo
+
+data_full |> 
+  filter(units == "OD") |> 
+  drop_na(r_max) |> 
+  ggplot(aes(x = r_max, y = condition)) +
+    geom_point(color = "#d95f02", size = 4) + 
+    xlim(c(NA, 0)) +
+    theme_minimal() -> p_rmax_od
+```
+
+```{r}
+
+plots <- c(p_overview_od, p_overview_fluo, p_param_od, p_param_fluo, p_cond_od, p_cond_fluo, p_rmax_od, p_rmax_fluo)
+
+
+svg(svDialogs::dlg_save(default = "plot.svg",
+                        filters = c("Vector grphics (*.svg)", "*.svg"),)$res)
+
+p_rmax_fluo
+
+
+dev.off() 
+
+
+ 
+```
+
+
+# Normalization & statistic intra-experiment
+
+
+
+```{r}
+data_full_intra <- data_well_based$OD |> mutate(units = "OD") |>
+  bind_rows(data_well_based$fluo |> mutate(units = "Fluo")) |> 
+  extract(well, into = c("row", "col"), regex = "(\\w)(\\d+)", remove = FALSE) |>
+  mutate(col = as.numeric(col))
+
+data_full_intra_normalized <- data_full_intra |> 
+  mutate(across(c(value, fit, p_max, p_min, r_max), \(x) x/p_max)) |> 
+  select(!p_max)
+
+data_full_intra_normalized |> 
+  select(well, condition, units, p_min, r_max, s) |> 
+  group_by(well, units) |> 
+  summarise(across(where(is.numeric), mean), units = first(units), condition = first(condition)) |> 
+  pivot_wider(names_from = units, values_from = c(p_min, r_max, s)) |> 
+  mutate(condition = as.factor(condition)) |> 
+  drop_na() |> 
+  ungroup() |> 
+  select(!c(well, condition)) |> 
+  corrr::correlate() -> param_correlation
+
+param_correlation
+
+param_correlation |> corrr::network_plot()
+param_correlation |> corrr::shave() |> corrr::rplot()
+
+
+
+anova <- aov(r_max ~ condition, 
+             data_full_intra |> 
+               select(well, condition, units, p_max, p_min, r_max, s) |> 
+               group_by(well, units) |> 
+               summarise(across(where(is.numeric), mean), units = first(units), condition = first(condition)) |>                           filter(units == "OD") |> 
+               mutate(condition = as.factor(condition))) 
+broom::tidy(anova) 
+
+post_test <- multcomp::glht(anova,
+  linfct = multcomp::mcp(condition = "Tukey")
+)
+broom::tidy(post_test)
+```
+
+
+
