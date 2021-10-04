@@ -32,34 +32,107 @@ richard <- function(t, p_max, p_min, r_max, s){
   }
 
 
-fit_richard <- function(y, t) {
 
+fit_richard <- function(y, t, method = "LAD") {
+
+  lin <- lm(y ~ t)
+  r_estimate <- lin$coefficients[2]
+  sign <- sign(r_estimate)
   max_y <- max(y)
   min_y <- min(y)
-  r_boundary <- plyr::round_any(max_y-min_y, 10^(floor(log10(max_y-min_y))), f = ceiling)
-  s_boundary <- max(t)
 
-  fit <- GA::ga(
-    type = "real-valued",
-    fitness = \(p) -sum((y - richard2(t = t, p[1], p[2], p[3], p[4]))^2),
-    lower = c(
-      p_max = max_y - 0.01*max_y,
-      p_min = min_y - 0.01*max_y,
-      r_max = -r_boundary,
-      s     = 0),
-    upper = c(
-      p_max = max_y + 0.01*max_y,
-      p_min = min_y + 0.01*max_y,
-      r_max = r_boundary,
-      s     = s_boundary),
-    names = c(
-      "p_max",
-      "p_min",
-      "r_max",
-      "s"),
-    popSize = 100,
-    monitor = FALSE)@solution
+  s_boundary <- max(as.numeric(t))
 
-  return(fit)
-  }
+  estimates <- list()
+  estimates$p_max <- rnorm(100, mean = max_y, sd = 0.01*(max_y-min_y))
+  estimates$p_min <- rnorm(100, mean = min_y, sd = 0.01*(max_y-min_y))
+
+  estimates$r_max <- sign*10^rnorm(100, mean = log(abs(r_estimate), base = 10), sd = 1)
+  estimates$s <- rnorm(100, mean = max(t)/2, sd = 0.05*max(t))
+
+
+  suggestions <- cbind(estimates$p_max, estimates$p_min, estimates$r_max, estimates$s)
+
+
+
+  fitness_fun <- switch(method,
+    "LAD" = \(p) -sum(abs(y - richard(t, p[1], p[2], p[3], p[4]))),
+    "OLS" = \(p) -sum((y - richard(t, p[1], p[2], p[3], p[4]))^2),
+    "MLE" = \(p) sum(log(dnorm(y, max_y, 0.01*(max_y-min_y))+dnorm(y, min_y, 0.01*(max_y-min_y))))
+  )
+
+#do.call(richard, append(list(t),p))
+fit <- GA::de(type = "real-valued",
+              fitness = fitness_fun,
+              suggestions = suggestions,
+              lower   = c(
+                p_max = max_y - 0.05*(max_y-min_y),
+                p_min = 0,
+                r_max = min(0 , r_estimate * 100),
+                s     = 0),
+              upper = c(
+                p_max = max_y + 0.05*(max_y-min_y),
+                p_min = min_y + 0.05*(max_y-min_y),
+                r_max = max(0 , r_estimate * 100),
+                s     = s_boundary),
+              names = c(
+                "p_max",
+                "p_min",
+                "r_max",
+                "s"),
+              popSize = 100,
+              monitor = FALSE,
+              optim = FALSE,
+              maxiter = 100)
+
+
+  return(fit@solution[1,])
+
+  # })
+}
+
+
+
+#'
+#'
+#' @param .data     Float : Dataframe
+#' @param .time_col String : Name of the time column from the plate reader experiment
+#' @return The dataframe with the formated time column as elapsed hours
+#' @examples
+clean_time <- function(.data, .time_col) {
+  .data |>
+    mutate(
+      {{.time_col}} := lubridate::as_datetime({{.time_col}}),
+      {{.time_col}} := {{.time_col}} - first({{.time_col}}),
+      {{.time_col}} := as.numeric({{.time_col}}/3600)
+    )
+}
+
+#' @param .data Float : Dataframe
+#' @param wells Tidyselect : Tidyselect matching all the wells columns from your plate reader experiment
+#' @return The dataframe in long/tidy format
+#' @examples
+format_wellplate_long <- function(.data, wells = matches(regex("^[A-Za-z]{1}\\d{1,2}"))) {
+  .data |>
+    pivot_longer(cols = {{wells}},
+                 names_to = "well") |>
+    drop_na(value)
+}
+
+
+
+
+fit_data <- function(.data, .well ,.value, .time, method = "LAD") {
+  .data |>
+    select({{.well}}, {{.value}}, {{.time}}) |>
+    group_by({{.well}}) |>
+    nest({{.time}}  := {{.time}},
+         {{.value}} := {{.value}}) |>
+    rowwise() |>
+    mutate(fit = purrr::map2({{.value}}, {{.time}}, \(x,y) fit_richard(x, y, method = method))) |>
+    unnest_wider(fit) |>
+    select(-c({{.time}},
+              {{.value}}))
+
+}
 
